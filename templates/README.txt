@@ -1,0 +1,1 @@
+The slurm.sh file in this directory is for cluster submission using signac (see signac docs for details)

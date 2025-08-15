@@ -1,0 +1,4 @@
+__pycache__/ *.pyc .ipynb_checkpoints/ .venv/ .env
+data/ results/ outputs/ logs/ slurm-*.out
+*.npy *.npz *.h5 *.hdf5 *.gsd *.ckpt *.pt
+.DS_Store .vscode/ .idea/
