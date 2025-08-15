@@ -1,0 +1,1 @@
+]633;E;nvidia-smi --query-gpu=driver_version,cuda_version,name --format=csv,noheader;8837d28d-d36b-44f8-94a9-6d5ed4b8fbf8]633;Cnvidia-smi not available

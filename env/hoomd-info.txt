@@ -1,0 +1,6 @@
+python: 3.12.5
+platform: Linux-4.18.0-553.44.1.el8_10.x86_64-x86_64-with-glibc2.28
+hoomd: 4.8.2
+GPU device failed: RuntimeError: No supported GPUs are present on this system.
+Failed to get GPU device count: CUDA driver version is insufficient for CUDA runtime version
+
