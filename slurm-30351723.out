@@ -1,2 +1,0 @@
-notice(2): Setting number of TBB threads to value of OMP_NUM_THREADS=1
-init.gsd: wrote 100 centers in box 100.0

@@ -7,3 +7,17 @@ data/ results/ outputs/ logs/ slurm-*.out
 slurm-*.out
 slurm-*.err
 slurm-*.log
+# SLURM job outputs (anywhere)
+slurm-*.out
+slurm-*.err
+slurm-*.log
+**/slurm-*.out
+**/slurm-*.err
+**/slurm-*.log
+# variants with suffixes
+slurm-*.out.*
+slurm-*.err.*
+slurm-*.log.*
+**/slurm-*.out.*
+**/slurm-*.err.*
+**/slurm-*.log.*
