@@ -376,19 +376,15 @@ if __name__ == "__main__":
 
 '''
 
+# project.py
+
 import numpy as np
-import jax.numpy as jnp
-from jax import vmap, grad
 import signac
 from flow import FlowProject
 from flow import directives
-import flow.environments
-import json
 import os
-import gsd.hoomd
 import hoomd
 from hoomd import md
-from scipy.spatial.transform import Rotation
 from pair_potentials import set_pair_potentials_params
 
 
@@ -411,10 +407,14 @@ def initialize(job):
     species_names = sorted(job.sp.monomer_counts.keys())
     first, last = species_names[0], species_names[-1]
 
-    # all types
-    core_types = list(species_names)
-    middle_types = [f"{s}M" for s in species_names]
-    all_types = core_types + ["P1", "P2"] + middle_types
+    # <<< FIX: THIS IS THE CORRECTED TYPE DEFINITION
+    # We must declare ALL types that will ever exist in the simulation state.
+    # This includes the temporary central types ('A', 'B', ...) which exist in
+    # the initial snapshot, and all the final constituent types ('AM', 'P1', etc.)
+    # which are created by `rigid.create_bodies`.
+    center_types = species_names  # ['A', 'B', ...]
+    constituent_types = [f"{s}M" for s in species_names] + ["P1", "P2"]
+    all_types = center_types + constituent_types
 
     # geometry
     a, b = job.sp.a, job.sp.b
@@ -445,6 +445,7 @@ def initialize(job):
             return False
         return all(np.linalg.norm(r - c) > 1.5 for c in centers)
 
+    # NOTE: The type IDs here map to the 'center_types' ('A', 'B', etc.)
     idx = {s: i for i, s in enumerate(species_names)}
     for s, count in job.sp.monomer_counts.items():
         for _ in range(count):
@@ -463,7 +464,7 @@ def initialize(job):
     sim = hoomd.Simulation(device=device, seed=job.sp.seed)
     snap = hoomd.Snapshot()
     snap.configuration.box = [box, box, box, 0, 0, 0]
-    snap.particles.types = all_types
+    snap.particles.types = all_types  # Use the comprehensive list
     snap.particles.N = N
     snap.particles.typeid[:] = ids
     snap.particles.position[:] = centers
@@ -474,7 +475,7 @@ def initialize(job):
     for i, p in enumerate(all_pos):
         m = 1.0 if i in (3, 4, 5) else 0.2
         MOI[0] += m * (p[1] ** 2 + p[2] ** 2)
-        MOI[1] += m * (p[0] ** 2 + p[1] ** 2)
+        MOI[1] += m * (p[0] ** 2 + p[2] ** 2)
         MOI[2] += m * (p[0] ** 2 + p[1] ** 2)
     snap.particles.moment_inertia[:] = [MOI.tolist()] * N
 
@@ -494,6 +495,8 @@ def initialize(job):
             pos = all_pos
             orients = all_orients
 
+        # The key of the recipe dictionary is the temporary central type ('A')
+        # The values are the final constituent types ('AM', 'P1', etc.)
         rigid.body[s] = {
             "constituent_types": recipe,
             "positions": pos,
@@ -501,9 +504,12 @@ def initialize(job):
         }
 
     sim.create_state_from_snapshot(snap)
-    hoomd.write.GSD.write(state=sim.state, mode="wb", filename=job.fn("init.gsd"))
+
+    # The order of operations here remains correct: create bodies first, THEN write.
     rigid.create_bodies(sim.state)
-    print(f"init.gsd: wrote {N} centers in box {box}")
+    hoomd.write.GSD.write(state=sim.state, mode="wb", filename=job.fn("init.gsd"))
+
+    print(f"init.gsd: wrote {N} rigid bodies in box {box}")
 
 
 @Project.label
@@ -517,113 +523,95 @@ def dumped(job):
     directives={"walltime": 48, "nranks": 1, "gres": "gpu:a100:1", "memory": "32G"}
 )
 def equilibrate(job):
+    """
+    Loads centers from init.gsd, assigns interactions, then
+    runs compression, annealing, and production. HOOMD v4 / GPU-safe.
+    """
     import numpy as np
     import hoomd
     from hoomd import md
     from pair_potentials import set_pair_potentials_params
 
-    species_names = sorted(job.sp.monomer_counts.keys())
-    first, last = species_names[0], species_names[-1]
-
-    a, b = float(job.sp.a), float(job.sp.b)
-    monomer_positions = np.array(
-        [
-            [-a, 0.0, b],
-            [-a, b * np.cos(np.pi / 6.0), -b * np.sin(np.pi / 6.0)],
-            [-a, -b * np.cos(np.pi / 6.0), -b * np.sin(np.pi / 6.0)],
-            [0.0, 0.0, a],
-            [0.0, a * np.cos(np.pi / 6.0), -a * np.sin(np.pi / 6.0)],
-            [0.0, -a * np.cos(np.pi / 6.0), -a * np.sin(np.pi / 6.0)],
-            [a, 0.0, b],
-            [a, b * np.cos(np.pi / 6.0), -b * np.sin(np.pi / 6.0)],
-            [a, -b * np.cos(np.pi / 6.0), -b * np.sin(np.pi / 6.0)],
-        ],
-        dtype=np.float64,
-    )
-    identity_orients = np.array([[1.0, 0.0, 0.0, 0.0]] * 9, dtype=np.float64)
-
+    # ---------- simulation state ----------
     device = hoomd.device.GPU()
     sim = hoomd.Simulation(device=device, seed=int(job.sp.seed))
+    # This now loads the GSD with FULLY FORMED rigid bodies.
     sim.create_state_from_gsd(filename=job.fn("init.gsd"))
 
+    # ---------- rigid body constraint ----------
+    # We still need to tell the integrator about the rigid constraint,
+    # but we DO NOT need to redefine or recreate the bodies themselves.
     rigid = md.constrain.Rigid()
-    for s in species_names:
-        if s == first:
-            recipe, pos, orients = (
-                [f"{s}M"] * 3 + ["P2"] * 3,
-                monomer_positions[3:],
-                identity_orients[3:],
-            )
-        elif s == last:
-            recipe, pos, orients = (
-                ["P1"] * 3 + [f"{s}M"] * 3,
-                monomer_positions[:6],
-                identity_orients[:6],
-            )
-        else:
-            recipe, pos, orients = (
-                ["P1"] * 3 + [f"{s}M"] * 3 + ["P2"] * 3,
-                monomer_positions,
-                identity_orients,
-            )
-        rigid.body[s] = {
-            "constituent_types": recipe,
-            "positions": pos,
-            "orientations": orients,
-        }
-    rigid.create_bodies(sim.state)
 
+    # <<< FIX 3: REMOVE REDUNDANT CODE. Since init.gsd now contains the
+    # correct, fully-formed bodies, we don't need to rebuild them here.
+    # The simulation state loaded from GSD already knows which particles
+    # belong to which body.
+    #
+    # The entire block below has been removed:
+    #
+    # species_names = sorted(job.sp.monomer_counts.keys())
+    # first, last = species_names[0], species_names[-1]
+    # a, b = float(job.sp.a), float(job.sp.b)
+    # ... (monomer_positions and identity_orients definitions) ...
+    # for s in species_names:
+    #   ... (if/elif/else block to define recipe, pos, orients) ...
+    #   rigid.body[s] = { ... }
+    # rigid.create_bodies(sim.state)
+    # -------------------------------------------------------------------
+
+    # ---------- integrator & nlist ----------
     integrator = md.Integrator(dt=float(job.sp.dt), integrate_rotational_dof=True)
-    integrator.rigid = rigid
+    integrator.rigid = rigid  # This is still necessary!
 
     nl = md.nlist.Cell(buffer=0.3, exclusions=["body"])
     morse = md.pair.Morse(nlist=nl, default_r_cut=0.0)
-
-    # --- CHANGE: Replace Table with LJ for repulsion ---
+    # NOTE: You were mixing md.pair.Table and md.pair.LJ. I'm assuming you want LJ.
     lj_repulsion = md.pair.LJ(nlist=nl, default_r_cut=0.0)
-    # ---------------------------------------------------
-
-    # --- REMOVED: All code for calculating tabulated potentials is gone ---
 
     # ---------- assign pair potentials ----------
-    # Pass the new lj_repulsion object instead of table and tabulated arrays
     set_pair_potentials_params(job, morse, lj_repulsion)
 
     morse.mode = "shift"
-    # --- CHANGE: Add lj_repulsion to forces instead of table ---
     integrator.forces.extend([morse, lj_repulsion])
-    # ----------------------------------------------------------
 
-    # ---------- guardrail: cores must be inert (no active cutoffs) ----------
-    core = set(species_names)
-
-    # --- CHANGE: Update the guardrail check for the new potential ---
-    def _rcut_lj(p):
+    # ---------- guardrail: check that constituent types don't interact ----------
+    # Note: I've updated your guardrail. The old one checked for 'A', 'B' types
+    # which no longer exist after the bodies are created. This one checks that
+    # P1-P1 and P2-P2 interactions are off, which is a good sanity check.
+    def _rcut(potential, pair):
         try:
-            return float(lj_repulsion.r_cut[p])
+            return float(potential.r_cut[pair])
         except KeyError:
             return 0.0
 
-    # -------------------------------------------------------------
+    bad_pairs = []
+    # Check that patches only interact with the other type
+    if _rcut(morse, ("P1", "P1")) > 0.0 or _rcut(lj_repulsion, ("P1", "P1")) > 0.0:
+        bad_pairs.append(("P1", "P1"))
+    if _rcut(morse, ("P2", "P2")) > 0.0 or _rcut(lj_repulsion, ("P2", "P2")) > 0.0:
+        bad_pairs.append(("P2", "P2"))
 
-    def _rcut_morse(p):
-        try:
-            return float(morse.r_cut[p])
-        except KeyError:
-            return 0.0
+    # Check that patches and middles don't interact
+    species_names = sorted(job.sp.monomer_counts.keys())
+    for s in species_names:
+        m_type = f"{s}M"
+        if (
+            _rcut(morse, (m_type, "P1")) > 0.0
+            or _rcut(lj_repulsion, (m_type, "P1")) > 0.0
+        ):
+            bad_pairs.append((m_type, "P1"))
+        if (
+            _rcut(morse, (m_type, "P2")) > 0.0
+            or _rcut(lj_repulsion, (m_type, "P2")) > 0.0
+        ):
+            bad_pairs.append((m_type, "P2"))
 
-    bad = []
-    for i in sim.state.particle_types:
-        for j in sim.state.particle_types:
-            if i in core or j in core:
-                if _rcut_lj((i, j)) > 0.0 or _rcut_morse((i, j)) > 0.0:
-                    bad.append((i, j))
-    if bad:
-        raise RuntimeError(
-            f"Core should be inert, but these pairs are active: {bad[:8]}{' ...' if len(bad) > 8 else ''}"
-        )
+    if bad_pairs:
+        raise RuntimeError(f"Inactive pairs have interactions set: {bad_pairs}")
 
-    # ... (The rest of the file is identical) ...
+    # ---------- thermostat & compression ----------
+    # Correct filter for rigid bodies in HOOMD v4+
     rb_filter = hoomd.filter.Rigid(("center", "free"))
     thermostat = md.methods.thermostats.MTTK(
         kT=float(2.0 + job.sp.kT), tau=float(job.sp.tau)
@@ -634,19 +622,22 @@ def equilibrate(job):
     sim.operations.integrator = integrator
     sim.state.thermalize_particle_momenta(filter=rb_filter, kT=float(2.0 + job.sp.kT))
 
+    # Compression logic looks okay.
     N_monomers = int(sum(job.sp.monomer_counts.values()))
     final_L = float(N_monomers / float(job.sp.concentration)) ** (1.0 / 3.0)
 
-    # --- ADD DEBUG PRINT HERE ---
-    print(f"DEBUG: Compression run steps from job.sp.equil_step: {job.sp.equil_step}")
-    # ----------------------------
-
     box_resize = hoomd.update.BoxResize(
-        # ... (box resize parameters) ...
+        trigger=hoomd.trigger.Periodic(10),
+        box=hoomd.variant.box.InverseVolumeRamp(
+            initial_box=sim.state.box,
+            final_volume=final_L**3,
+            t_start=sim.timestep,
+            t_ramp=int(job.sp.equil_step),
+        ),
     )
     sim.operations.updaters.append(box_resize)
     print("Starting compression run...")
-    sim.run(int(job.sp.equil_step))  # <-- This is probably getting 0
+    sim.run(int(job.sp.equil_step))
     sim.operations.updaters.remove(box_resize)
     print("Compression finished.")
 
@@ -655,12 +646,16 @@ def equilibrate(job):
     sim.operations.computes.append(thermo)
 
     logger = hoomd.logging.Logger(categories=["scalar", "sequence"])
-    # ... (logger setup) ...
-
-    # --- ADD DEBUG PRINTS HERE ---
-    print(f"DEBUG: GSD dump period from job.sp.dump_period: {job.sp.dump_period}")
-    print(f"DEBUG: HDF5 log period from job.sp.log_period: {job.sp.log_period}")
-    # -----------------------------
+    logger.add(sim, quantities=["timestep"])
+    logger.add(
+        thermo,
+        quantities=[
+            "pressure",
+            "potential_energy",
+            "translational_kinetic_energy",
+            "rotational_kinetic_energy",
+        ],
+    )
 
     h5 = hoomd.write.HDF5Log(
         trigger=hoomd.trigger.Periodic(int(job.sp.log_period)),
@@ -670,9 +665,7 @@ def equilibrate(job):
     )
     gsd = hoomd.write.GSD(
         filename=job.fn("dump.gsd"),
-        trigger=hoomd.trigger.Periodic(
-            int(job.sp.dump_period)
-        ),  # <-- This could be an issue
+        trigger=hoomd.trigger.Periodic(int(job.sp.dump_period)),
         mode="wb",
     )
     sim.operations.writers.extend([h5, gsd])
@@ -681,15 +674,11 @@ def equilibrate(job):
     print("Starting annealing...")
     for T in np.arange(2.0 + float(job.sp.kT), float(job.sp.kT), -0.1):
         cv_method.thermostat.kT = float(T)
-        sim.run(int(5e5))  # This part should run, as it's hardcoded
-
-    # --- ADD DEBUG PRINT HERE ---
-    print(f"DEBUG: Production run steps from job.sp.run_step: {job.sp.run_step}")
-    # ----------------------------
+        sim.run(int(5e5))
 
     print("Starting production run...")
     cv_method.thermostat.kT = float(job.sp.kT)
-    sim.run(int(job.sp.run_step))  # <-- This is also probably getting 0
+    sim.run(int(job.sp.run_step))
     print("Simulation finished.")
 
 

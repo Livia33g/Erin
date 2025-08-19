@@ -60,8 +60,7 @@ with open(parameter_file, "r") as f:
             continue
         simulation_parameters.append((monomer_concentrations, kT))
 
-# ... (Volume refinement logic is unchanged) ...
-initial_total_volume = 1000000
+initial_total_volume = 10000000
 max_iterations = 100
 tolerance = 0.00005
 for monomer_concentrations, kT in simulation_parameters:
@@ -105,7 +104,7 @@ for monomer_concentrations, kT in simulation_parameters:
             # Simulation Setup
             "kT": kT,
             "alpha": alpha,
-            "equil_step": int(5e4),
+            "equil_step": int(2e6),
             "run_step": int(2e8),
         }
 
@@ -127,8 +126,8 @@ for monomer_concentrations, kT in simulation_parameters:
                 "rep_r_cut": 6,
                 "dt": 0.001,
                 "tau": 1.0,
-                "dump_period": int(1e5),
-                "log_period": int(1e4),
+                "dump_period": int(1e4),
+                "log_period": int(1e3),
             },
         }
 
