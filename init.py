@@ -126,7 +126,7 @@ for monomer_concentrations, kT in simulation_parameters:
                 "rep_r_cut": 6,
                 "dt": 0.001,
                 "tau": 1.0,
-                "dump_period": int(1e4),
+                "dump_period": int(1e2),
                 "log_period": int(1e3),
             },
         }
